@@ -17,6 +17,7 @@ from scipy.optimize import differential_evolution
 
 import json
 import ast
+import multiprocessing
 
 import numpy as np
 from scipy import special as sp
@@ -35,10 +36,13 @@ import optax
 from functools import partial
 
 
+# Fixed line offsets into the text blocks written by AnalyticResidual.writeFile().
+# ReadData relies on these to skip straight to the relevant line without parsing
+# the whole file, so they must stay in sync with writeFile()'s exact layout.
 energyline = 16
 stateline = 21
 timeline = 35
-blocksize = 35
+blocksize = 35   # number of lines per record; used to jump to record i via i*blocksize
 
 pline = 10
 SNRline = 11
@@ -48,20 +52,45 @@ titleline = 3
 
 pi = np.pi
 
-e1_Tri = np.array([1, 0, 0])
-e2_Tri = np.array([0.5, np.sqrt(3) / 2, 0])
-e1_sym = np.array([np.sqrt(3) / 2, -0.5, 0])
-e2_sym = np.array([np.sqrt(3) / 2, 0.5, 0])
-e1_L = np.array([1, 0, 0])
-e2_L = np.array([0, 1, 0])
+# Preset unit-vector pairs (e1, e2) for the two interferometer arms of a few
+# common detector layouts, for use as the `e1`/`e2` arguments of AnalyticResidual.
+e1_Tri = np.array([1, 0, 0])                       # equilateral triangle, arm 1
+e2_Tri = np.array([0.5, np.sqrt(3) / 2, 0])        # equilateral triangle, arm 2
+e1_sym = np.array([np.sqrt(3) / 2, -0.5, 0])       # symmetric about the x-axis, arm 1
+e2_sym = np.array([np.sqrt(3) / 2, 0.5, 0])        # symmetric about the x-axis, arm 2
+e1_L = np.array([1, 0, 0])                         # perpendicular (L-shaped), arm 1
+e2_L = np.array([0, 1, 0])                         # perpendicular (L-shaped), arm 2
 
 
-def PSO_wrapper(PSO_state, func, args):
-    swarmSize = PSO_state.shape[0]
-    Res_Vec = np.zeros(swarmSize)
-    for tt in range(swarmSize):
-        Res_Vec[tt] = func(PSO_state[tt], *args)
-    return Res_Vec
+def PSO_wrapper(pso_state, func, args, pool=None):
+    """Evaluate ``func`` for every particle in a pyswarms swarm state.
+
+    Parameters
+    ----------
+    pso_state : array of shape (n_particles, n_dimensions)
+        Current positions of all particles in the swarm.
+    func : callable
+        Objective function, called as ``func(pso_state[i], *args)`` for each particle.
+    args : tuple
+        Extra positional arguments forwarded to `func`.
+    pool : multiprocessing.Pool or None, optional
+        If given, particles are evaluated across this pool (one ``func(row, *args)``
+        call per particle, dispatched via ``pool.starmap``) instead of serially in
+        this process. `func` and every element of `args` must be picklable — a bound
+        method of a picklable object (e.g. AnalyticResidual.loss_function) is fine.
+
+    Returns
+    -------
+    costs : array of shape (n_particles,)
+        Objective value for each particle, as required by pyswarms.
+    """
+    if pool is None:
+        n_particles = pso_state.shape[0]
+        costs = np.zeros(n_particles)
+        for i in range(n_particles):
+            costs[i] = func(pso_state[i], *args)
+        return costs
+    return np.array(pool.starmap(func, [(row, *args) for row in pso_state]))
 
 
 class AnalyticResidual:
@@ -87,8 +116,11 @@ class AnalyticResidual:
             "volume forcesym"         extra seismometer mirrored at bisecting plane
             "volume forcesym mirror"  extra seismometer mirrored at bisecting line
             "volume multipleX"        X seismometers per borehole
-    default_loss : string, optional
-        Output of the residual function. The default is "mean".
+    default_mirror : string, optional
+        Which mirror(s) residual() reports on, and how they are combined. The
+        default is "mean". Not to be confused with the `loss` argument of
+        loss_function()/optimize_*(), which selects the optimization objective
+        type ("residual"/"broadband"/"budget") instead.
         Options: "in", "in1", "in2", "end1", "end2", "all"/"max", "mean"
     e1, e2 : array of length 3, optional
         Unit vectors along the two arms. The default is e1_Tri, e2_Tri.
@@ -118,39 +150,10 @@ class AnalyticResidual:
         z coordinate bounds for "volume" modes [m]. The default is [-300, 300].
     """
 
-    e1 = np.array([1, 0, 0])
-    e2 = np.array([0.5, np.sqrt(3) / 2, 0])
+    # NOTE: all instance attributes are set in __init__ (there are no class-level
+    # defaults) — construct an instance to get e1, e2, mode, mirror, bounds, etc.
 
-    d_in1 = 64.12
-    d_in2 = 64.12
-    d_end1 = 536.35
-    d_end2 = 536.35
-
-    c_p = 6000
-    c_s = 4000
-
-    tunnel_length = 5000
-    reverse_tunnel_length = 500
-    tunnel_radius = 5
-    tunnel_radius_min = 5
-    tunnel_radius_max = 20
-    polar_angle_max = 380
-    azimuthal_angle_max = 200
-    volume_extent_xy = [-1000, 1000]
-    volume_extent_z = [-300, 300]
-
-    default_mode = "volume"
-    default_loss = "mean"
-    mode = "volume"
-    loss = "mean"
-    optimization_method = "particleSwarm"
-
-    Nmult = 1
-    dim = 3
-    lower_bound = [volume_extent_xy[0], volume_extent_xy[0], volume_extent_z[0]]
-    upper_bound = [volume_extent_xy[1], volume_extent_xy[1], volume_extent_z[1]]
-
-    def __init__(self, default_mode="volume", default_loss="mean", e1=e1_Tri, e2=e2_Tri,
+    def __init__(self, default_mode="volume", default_mirror="mean", e1=e1_Tri, e2=e2_Tri,
                  d_in1=64.12, d_in2=64.12, d_end1=536.35, d_end2=536.35,
                  c_p=6000, c_s=4000, tunnel_length=5000, reverse_tunnel_length=500,
                  tunnel_radius=5, tunnel_radius_min=5, tunnel_radius_max=20,
@@ -183,13 +186,81 @@ class AnalyticResidual:
         self.volume_extent_z = volume_extent_z
 
         self.default_mode = default_mode
-        self.default_loss = default_loss
+        self.default_mirror = default_mirror
         self.mode = default_mode
-        self.loss = default_loss
+        self.mirror = default_mirror
+
+        # loss/optimization_method/optimization_options are normally (re)set by
+        # optimize_PSO/DE/Adam; defaulted here too so writeFile()/writeFile2()
+        # also work on a fresh instance that hasn't run an optimizer yet.
+        self.loss = "residual"
+        self.optimization_method = "particleSwarm"
+        self.optimization_options = {}
 
         self.Nmult = self.get_Nmult()
         self.dim = self.get_dim()
         self.lower_bound, self.upper_bound = self.get_bounds()
+
+        # See _jit_cache_key()/__hash__/_check_not_jit_locked() below: this instance
+        # becomes immutable (w.r.t. the fields in _jit_cache_key) the first time
+        # residual()/loss_function() actually traces for it.
+        self._jit_locked = False
+
+
+
+    def _jit_cache_key(self):
+        """
+        Value-identity snapshot of every attribute read *inside* a @jax.jit-decorated
+        method (css, csn_*, cnn_*, wf, residual, loss_function, state_to_coordinates —
+        via self.mode/self.e1/self.e2/self.c_p/self.c_s/self.d_in*/self.d_end*/
+        self.tunnel_radius/self.volume_extent_z/self.Nmult/self.dim).
+
+        Those methods take `self` as a static jit argument, so JAX's compilation
+        cache keys on hash(self)/self == other rather than tracing these values —
+        without a value-based __hash__/__eq__ (defined right below using this key),
+        two equal-content instances would recompile from scratch instead of sharing
+        a compiled trace (slow).
+
+        IMPORTANT: if a future change makes any @jax.jit method read a new self.*
+        attribute, that attribute MUST be added here too, or two instances that
+        differ only in that attribute would wrongly be treated as identical.
+
+        This key must never change on an instance that has already been JIT-traced
+        (see _jit_locked / _check_not_jit_locked): a Python dict/cache assumes a
+        key's hash is fixed for as long as it may be stored in that structure, and
+        JAX's internal jit cache is exactly such a structure. Mutating self.e1 (etc.)
+        in place *after* tracing was empirically found to not just make that one
+        instance return stale pre-mutation results, but to corrupt the shared cache
+        for *unrelated* instances too (a later, never-mutated instance whose fields
+        happened to match the post-mutation key could get back the stale answer).
+        defineGeometry()/set_default_mode()/set_default_mirror() therefore refuse to
+        run once an instance is locked — construct a new AnalyticResidual instead.
+        """
+        return (
+            self.mode,
+            tuple(np.asarray(self.e1).tolist()),
+            tuple(np.asarray(self.e2).tolist()),
+            self.d_in1, self.d_in2, self.d_end1, self.d_end2,
+            self.c_p, self.c_s, self.tunnel_radius,
+            tuple(self.volume_extent_z),
+            self.Nmult, self.dim,
+        )
+
+    def __hash__(self):
+        return hash(self._jit_cache_key())
+
+    def __eq__(self, other):
+        return isinstance(other, AnalyticResidual) and self._jit_cache_key() == other._jit_cache_key()
+
+    def _check_not_jit_locked(self, what):
+        if getattr(self, "_jit_locked", False):
+            raise RuntimeError(
+                f"Cannot call {what}() on this AnalyticResidual: it has already been used "
+                f"in a JIT-traced call (residual()/loss_function()). Mutating it now would "
+                f"silently corrupt JAX's compilation cache (for this instance AND possibly "
+                f"other, unrelated instances — see _jit_cache_key()'s docstring). "
+                f"Construct a new AnalyticResidual with the geometry you want instead."
+            )
 
 
 
@@ -199,6 +270,7 @@ class AnalyticResidual:
                        polar_angle_max=None, azimuthal_angle_max=None,
                        volume_extent_xy=None, volume_extent_z=None):
         """Redefine geometry parameters. Any parameter left as None keeps its current value."""
+        self._check_not_jit_locked("defineGeometry")
 
         self.e1 = self.e1 if e1 is None else e1
         self.e2 = self.e2 if e2 is None else e2
@@ -228,6 +300,7 @@ class AnalyticResidual:
 
     def set_default_mode(self, mode):
         """Sets the default coordinate system mode."""
+        self._check_not_jit_locked("set_default_mode")
         self.default_mode = mode
         self.mode = mode
         self.Nmult = self.get_Nmult()
@@ -236,10 +309,13 @@ class AnalyticResidual:
 
 
 
-    def set_default_loss(self, loss):
-        """Sets the default optimization loss."""
-        self.default_loss = loss
-        self.loss = loss
+    def set_default_mirror(self, mirror):
+        """Sets the default mirror selection used by residual() (see `default_mirror`
+        in the class docstring). Not to be confused with the `loss` type argument
+        of loss_function()/optimize_*().
+        """
+        self.default_mirror = mirror
+        self.mirror = mirror
 
 
 
@@ -659,7 +735,6 @@ class AnalyticResidual:
 
     # ************************** RESIDUAL FUNCTION ************************** #
 
-    @partial(jax.jit, static_argnums=(0, 2, 6, 7,))
     def residual(self, state, N, freq, SNR, p, mirror="all", combine_in=True):
         """
         Returns sqrt(residual) — the Wiener-filter noise reduction factor.
@@ -679,6 +754,10 @@ class AnalyticResidual:
         mirror : string (static)
             Which mirror(s) to report: "in", "in1", "in2", "end1", "end2",
             "all"/"max" (maximum over mirrors), "mean".
+            Note: "mean"/"max" aggregate the *pre-sqrt* per-mirror values and
+            take sqrt once at the end. max() commutes with sqrt (so it equals
+            the max of the individually-queried sqrt'd mirrors), but mean()
+            does not — sqrt(mean(a, b, c)) != mean(sqrt(a), sqrt(b), sqrt(c)).
         combine_in : bool (static)
             If True, treat in-mirrors as correlated (single differential signal).
 
@@ -687,6 +766,14 @@ class AnalyticResidual:
         float
             sqrt(residual), in [0, 1]; lower is better.
         """
+        # Plain (non-jitted) wrapper so the lock is set on *every* call, including
+        # ones that hit an already-compiled cache entry (which never re-executes
+        # _residual_jit's Python body — see _jit_cache_key()'s docstring).
+        self._jit_locked = True
+        return self._residual_jit(state, N, freq, SNR, p, mirror, combine_in)
+
+    @partial(jax.jit, static_argnums=(0, 2, 6, 7,))
+    def _residual_jit(self, state, N, freq, SNR, p, mirror="all", combine_in=True):
         state = jnp.array(state, dtype=jnp.float64)
         x, y, z, Nloc = self.state_to_coordinates(state, N)
 
@@ -739,12 +826,129 @@ class AnalyticResidual:
         return jnp.sqrt(residual_val + 1e-12)
 
 
+    def loss_function(self, state, N, freq, SNR, p, mirror="all", combine_in=True, residual_limits=None, cost_limit=None, loss="residual"):
+        """
+        Optimization objective built on top of residual() / broadband_loss(), with
+        optional soft constraints added on top. This is what optimize_PSO/DE/Adam
+        actually minimize; it is not itself bounded to [0, 1] like residual() is.
+
+        Note the naming clash with `mirror`: `mirror` selects *which* mirror(s)
+        residual() reports on ("mean", "end1", "in", ...), while `loss` selects
+        which objective *type* to compute below — they are independent arguments.
+
+        Parameters
+        ----------
+        state, N, SNR, p, mirror, combine_in
+            Forwarded to residual() / broadband_loss(). See residual() for details.
+        freq : float or array
+            Wiener filter frequency. A single float when loss contains "residual";
+            an array of frequencies when loss contains "broadband" (forwarded to
+            broadband_loss as `freqs`).
+        residual_limits : array or None, optional
+            Per-frequency target residual for the "broadband" objective. Only used
+            when loss contains "broadband"; see broadband_loss().
+        cost_limit : float or None, optional
+            Maximum allowed borehole-depth budget. Only applied when loss contains
+            "budget" *in addition to* "residual" or "broadband" (e.g. "residual budget") —
+            passing cost_limit without "budget" in loss has no effect. Defaults to N.
+        loss : string (static), optional
+            Selects the objective type and its soft constraints, matched by
+            substring (case-insensitive):
+                "residual"                     -> residual() at a single freq (default)
+                "broadband"                    -> broadband_loss() over freq (array)
+                add "budget"                   -> scale by a borehole-depth cost penalty
+                add "unlimited"/"unconstrained" -> skip the volume_extent_z boundary penalty
+
+        Returns
+        -------
+        float
+            Loss value to minimize. Equals the residual only when "unlimited" or
+            "unconstrained" is set and "budget" is not; otherwise inflated by the
+            soft penalty term(s) below.
+        """
+        # Plain (non-jitted) wrapper so the lock is set on *every* call, including
+        # ones that hit an already-compiled cache entry — see residual()/
+        # _jit_cache_key()'s docstring for why that matters.
+        self._jit_locked = True
+        return self._loss_function_jit(state, N, freq, SNR, p, mirror, combine_in, residual_limits, cost_limit, loss)
+
+    @partial(jax.jit, static_argnums=(0, 2, 6, 7, 10))
+    def _loss_function_jit(self, state, N, freq, SNR, p, mirror="all", combine_in=True, residual_limits=None, cost_limit=None, loss="residual"):
+        loss_value = 0
+        if "residual" in loss.lower() or loss.lower()[0] == "r":
+            loss_value = self.residual(state, N, freq, SNR, p, mirror=mirror, combine_in=combine_in)
+        elif "broadband" in loss.lower() or loss.lower()[0:2] == "bb":
+            loss_value = self.broadband_loss(state, N, freq, SNR, p, mirror, combine_in, residual_limits)
+        else:
+            print("unknown loss")
+
+        if not ("unlimited" in loss.lower() or "unconstrained" in loss.lower()):
+            # Soft barrier: stays ~1 while z is well within [volume_extent_z[0], ...[1]],
+            # blows up towards A as z approaches or crosses either bound.
+            A = 1e12  # penalty factor
+            b = 100   # steepness
+            alpha = 10
+            x, y, z, Nloc = self.state_to_coordinates(state, N)
+            loss_value *= 1 / alpha * jax.nn.logsumexp(alpha * (
+                A + (1 - A)
+                * jax.nn.sigmoid(b * (z - self.volume_extent_z[0]))
+                * jax.nn.sigmoid(-b * (z - self.volume_extent_z[1]))
+            ))
+        if "budget" in loss.lower():
+            if cost_limit is None:
+                cost_limit = N
+            A = 1e4
+            b = 100
+            x, y, z, Nloc = self.state_to_coordinates(state, N)
+            maxz = jnp.max(z.reshape((N, self.Nmult)), axis=1)
+            loss_value *= (1 + (A - 1) * jax.nn.sigmoid(b * (jnp.sum(self.volume_extent_z[1] - maxz) / (self.volume_extent_z[1] - self.volume_extent_z[0]) - cost_limit)))
+        # To avoid too large z-component (old)
+        # loss_value *= np.exp(a*np.sum((z/600)**expon))
+        return loss_value
+
+
+    def broadband_loss(self, state, N, freqs, SNR, p, mirror="all", combine_in=True, residual_limits=None):
+        """
+        Sum of per-frequency residuals, softly penalized wherever a residual
+        exceeds its target `residual_limits`. Called by loss_function() when
+        `loss` contains "broadband"; not JIT-compiled itself (loops in Python
+        over `freqs`, calling the jitted residual() once per frequency).
+
+        Parameters
+        ----------
+        state, N, SNR, p, mirror, combine_in
+            Forwarded to residual() for each frequency. See residual() for details.
+        freqs : array
+            Frequencies [Hz] at which to evaluate the residual.
+        residual_limits : array of length len(freqs) or None, optional
+            Target residual per frequency; residuals above their limit are
+            penalized more heavily. Defaults to all-ones (i.e. target = no
+            mitigation) when not given.
+
+        Returns
+        -------
+        float
+            Sum over frequencies of residual * penalty_factor(residual vs. limit).
+        """
+        if residual_limits is None:
+            residual_limits = jnp.ones((len(freqs)))
+
+        A = 100 * len(freqs)  # penalty factor
+        b = 1000               # steepness
+        residual_value = jnp.zeros((len(freqs)))
+        for i, freq in enumerate(freqs):
+            residual_value = residual_value.at[i].set(self.residual(state, N, freq, SNR, p, mirror=mirror, combine_in=combine_in))
+            # loss_value += residual_value * np.exp(9000*(residual_value/residual_limits[i])**20)
+        loss_value = jnp.sum(residual_value * (1 + (A - 1) * 1 / (1 + jnp.exp(-b * (residual_value - residual_limits)))))
+        return loss_value
+
 
     # ************************** OPTIMIZATION ************************** #
 
-    def optimize_PSO(self, N, freq, SNR, p, loss="all", combine_in=True,
-                     optimization_options=None, worker=1, savename="",
-                     step_callback=None, stop_event=None):
+    def optimize_PSO(self, N, freq, SNR, p, mirror="all", combine_in=True, 
+                     residual_limits=None, cost_limit=None, loss="residual", 
+                     optimization_options=None, worker=1,
+                     savename="", step_callback=None, stop_event=None):
         """
         Optimize seismometer positions with Particle Swarm Optimization.
 
@@ -758,16 +962,51 @@ class AnalyticResidual:
             Seismometer signal-to-noise ratio.
         p : float
             P-wave fraction in [0, 1].
-        loss : string, optional
+        mirror : string, optional
             Mirror selection for the residual. The default is "all".
         combine_in : bool, optional
             Whether to treat in-mirrors as correlated. The default is True.
+        residual_limits, cost_limit, loss : optional
+            Forwarded to loss_function() — see there for details. The default
+            loss is "residual" (plain residual, boundary-penalized).
         optimization_options : dict, optional
             PSO hyperparameters (swarm_size, c1, c2, w, k, p, niter, ftol, ftol_iter).
         worker : int, optional
-            Number of parallel workers. The default is 1.
+            Number of worker processes to evaluate particles in parallel. The
+            default is 1 (no multiprocessing — evaluate particles one at a time
+            in this process). For worker > 1, a multiprocessing.Pool(worker) is
+            created and used to evaluate all particles of each PSO iteration in
+            parallel; stop_event/step_callback still run in this main process
+            exactly as with worker=1, so "Stop" and live progress keep working.
+            Requirements for worker > 1 (standard Python multiprocessing caveats):
+              - On Windows, the top-level script must guard its entry point with
+                ``if __name__ == "__main__":`` (multiprocessing uses "spawn" and
+                re-imports the script in every worker process).
+              - loss_function and everything reachable from `self` must be
+                picklable (true today: AnalyticResidual only holds plain Python/
+                NumPy attributes).
+              - Each worker process has its own JAX JIT cache, so the first
+                evaluation in every worker recompiles loss_function independently
+                — worth it once swarm_size * niter is large enough that per-particle
+                evaluation time dominates that one-off per-worker compile cost.
+              - No thread cap is applied here: JAX/XLA may itself multithread the
+                linear algebra inside each particle's evaluation across all visible
+                cores, on top of the `worker` processes — for large problems this
+                is usually fine (the OS's scheduler time-shares busy cores), but if
+                you tune `worker`, keep in mind it multiplies against however many
+                threads XLA already uses per evaluation, not instead of it.
         savename : string, optional
             If non-empty, write result to this file. The default is "".
+        step_callback : callable(step, residual, state) or None, optional
+            Called once per PSO iteration (after evaluating the whole swarm, in
+            this main process) with the iteration index (int), best cost so far
+            in this run (float), and the corresponding position (numpy array of
+            size N*dim). Use this to drive a live GUI plot.
+        stop_event : threading.Event or None, optional
+            Checked once per PSO iteration; when set, the run stops before the
+            next iteration and returns the best (cost, position) found so far —
+            or (inf, zeros(N*dim)) if stopped before the first iteration ever
+            completed. Allows a GUI Stop button to interrupt a long run.
 
         Returns
         -------
@@ -804,10 +1043,19 @@ class AnalyticResidual:
         class _PSOStopped(Exception):
             pass
 
+        # Parallelism is implemented here (inside PSO_wrapper, via our own Pool)
+        # rather than through pyswarms' own `n_processes` (left None below):
+        # pyswarms would pickle *this* closure to send to its workers, and a
+        # closure over stop_event/step_callback/best-tracking isn't picklable —
+        # nor would running that bookkeeping in a worker process make sense.
+        # Keeping n_processes=None means wrapped_pso always runs here, in the
+        # main process, once per iteration, exactly as with worker=1.
+        pool = multiprocessing.Pool(worker) if worker > 1 else None
+
         def wrapped_pso(pso_state, func, args):
             if stop_event is not None and stop_event.is_set():
                 raise _PSOStopped()
-            costs = PSO_wrapper(pso_state, func, args)
+            costs = PSO_wrapper(pso_state, func, args, pool=pool)
             best_idx = int(np.argmin(costs))
             _best_cost[0] = float(costs[best_idx])
             _best_pos[0]  = np.array(pso_state[best_idx])
@@ -817,17 +1065,22 @@ class AnalyticResidual:
             return costs
 
         try:
-            optimizationResult = optimizer.optimize(
-                wrapped_pso, self.optimization_options["niter"],
-                n_processes=None, func=self.residual, args=(N, freq, SNR, p, loss, combine_in)
-            )
-            best_cost, best_pos = optimizationResult[0], optimizationResult[1]
-        except _PSOStopped:
-            print("  PSO stopped early by stop_event.")
-            best_cost = _best_cost[0]
-            best_pos  = _best_pos[0]
-            if best_pos is None:
-                best_pos = np.zeros(self.dim * N)
+            try:
+                optimization_result = optimizer.optimize(
+                    wrapped_pso, self.optimization_options["niter"],
+                    n_processes=None, func=self.loss_function, args=(N, freq, SNR, p, mirror, combine_in, residual_limits, cost_limit, loss)
+                )
+                best_cost, best_pos = optimization_result[0], optimization_result[1]
+            except _PSOStopped:
+                print("  PSO stopped early by stop_event.")
+                best_cost = _best_cost[0]
+                best_pos  = _best_pos[0]
+                if best_pos is None:
+                    best_pos = np.zeros(self.dim * N)
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
         if savename != "":
             self.writeFile(best_cost, best_pos, N, freq, SNR, p, savename, starttime)
@@ -836,9 +1089,10 @@ class AnalyticResidual:
 
 
 
-    def optimize_DE(self, N, freq, SNR, p, loss="all", combine_in=True,
-                    optimization_options=None, worker=1, savename="",
-                    step_callback=None, stop_event=None):
+    def optimize_DE(self, N, freq, SNR, p, mirror="all", combine_in=True,
+                     residual_limits=None, cost_limit=None, loss="residual", 
+                     optimization_options=None, worker=1,
+                     savename="", step_callback=None, stop_event=None):
         """
         Optimize seismometer positions with Differential Evolution.
 
@@ -852,16 +1106,35 @@ class AnalyticResidual:
             Seismometer signal-to-noise ratio.
         p : float
             P-wave fraction in [0, 1].
-        loss : string, optional
+        mirror : string, optional
             Mirror selection for the residual. The default is "all".
         combine_in : bool, optional
             Whether to treat in-mirrors as correlated. The default is True.
+        residual_limits, cost_limit, loss : optional
+            Forwarded to loss_function() — see there for details. The default
+            loss is "residual" (plain residual, boundary-penalized).
         optimization_options : dict, optional
             DE hyperparameters (popsize, recombination, mutation, niter, ftol).
         worker : int, optional
-            Number of parallel workers. The default is 1.
+            Number of worker processes scipy.optimize.differential_evolution uses
+            to evaluate the population in parallel (passed through as its own
+            `workers` argument, with `updating='deferred'` so parallel evaluation
+            is actually used). The default is 1 (no multiprocessing). Same caveats
+            as optimize_PSO's `worker`: needs ``if __name__ == "__main__":`` on
+            Windows, loss_function/self must be picklable (true today), and each
+            worker process pays its own one-off JIT re-compile of loss_function —
+            only worth it once popsize * niter is large enough to amortize that.
         savename : string, optional
             If non-empty, write result to this file. The default is "".
+        step_callback : callable(step, residual, state) or None, optional
+            Called once per DE generation (in this main process, regardless of
+            `worker`) with the generation index (int), current best cost (float),
+            and best position (numpy array of size N*dim). Use this to drive a
+            live GUI plot.
+        stop_event : threading.Event or None, optional
+            Checked once per DE generation; when set, the run stops before the
+            next generation (scipy still returns its best result found so far).
+            Allows a GUI Stop button to interrupt a long run.
 
         Returns
         -------
@@ -875,20 +1148,20 @@ class AnalyticResidual:
         bound = np.array([self.lower_bound, self.upper_bound]).T
         x_bound = list(bound) * N
 
-        residualParameter = (N, freq, SNR, p, loss, combine_in)
+        residual_parameter = (N, freq, SNR, p, mirror, combine_in, residual_limits, cost_limit, loss)
 
         iteration = [0]
 
         def de_cb(xk, convergence=0.0):
             if step_callback is not None:
-                res = float(self.residual(
-                    jnp.array(xk, dtype=jnp.float64), N, freq, SNR, p, loss, combine_in))
+                res = float(self.loss_function(
+                    jnp.array(xk, dtype=jnp.float64), *residual_parameter))
                 step_callback(iteration[0], res, np.array(xk))
             iteration[0] += 1
             return stop_event is not None and stop_event.is_set()
 
-        optimizationResult = differential_evolution(
-            self.residual, x_bound, residualParameter,
+        optimization_result = differential_evolution(
+            self.loss_function, x_bound, residual_parameter,
             disp=True,
             maxiter=self.optimization_options["niter"],
             popsize=self.optimization_options["popsize"],
@@ -901,8 +1174,8 @@ class AnalyticResidual:
             updating='deferred',
             callback=de_cb,
         )
-        best_cost = float(self.residual(optimizationResult.x, *residualParameter))
-        best_pos = optimizationResult.x
+        best_cost = float(self.loss_function(optimization_result.x, *residual_parameter))
+        best_pos = optimization_result.x
 
         if savename != "":
             self.writeFile(best_cost, best_pos, N, freq, SNR, p, savename, starttime)
@@ -911,9 +1184,10 @@ class AnalyticResidual:
 
 
 
-    def optimize_Adam(self, N, freq, SNR, p, loss="all", combine_in=True,
-                      optimization_options=None, initial_state=None, savename="",
-                      step_callback=None, stop_event=None):
+    def optimize_Adam(self, N, freq, SNR, p, mirror="all", combine_in=True,
+                     residual_limits=None, cost_limit=None, loss="residual", 
+                     optimization_options=None, initial_state=None, 
+                     savename="", step_callback=None, stop_event=None):
         """
         Optimize seismometer positions with the Adam gradient-descent algorithm.
 
@@ -931,10 +1205,13 @@ class AnalyticResidual:
             Seismometer signal-to-noise ratio.
         p : float
             P-wave fraction in [0, 1].
-        loss : string, optional
+        mirror : string, optional
             Mirror selection for the residual. The default is "all".
         combine_in : bool, optional
             Whether to treat in-mirrors as correlated. The default is True.
+        residual_limits, cost_limit, loss : optional
+            Forwarded to loss_function() — see there for details. The default
+            loss is "residual" (plain residual, boundary-penalized).
         optimization_options : dict, optional
             Adam hyperparameters:
                 learning_rate : step size (default 1e-5)
@@ -981,7 +1258,7 @@ class AnalyticResidual:
 
         # --- Differentiable loss closure (value + gradient in one pass) ---
         def loss_fn(s):
-            return self.residual(s, N, freq, SNR, p, loss, combine_in)
+            return self.loss_function(s, N, freq, SNR, p, mirror, combine_in, residual_limits, cost_limit, loss)
 
         vg_fn = jax.jit(jax.value_and_grad(loss_fn))
 
@@ -998,12 +1275,14 @@ class AnalyticResidual:
         init_val, _ = vg_fn(state)
         pos_hist = [state]
         res_hist = [float(init_val)]
+        grad_hist = [0]
 
         nsteps = 0
         prec = float("inf")
 
         while prec > ftol and nsteps < max_steps and not (stop_event is not None and stop_event.is_set()):
             val, grads = vg_fn(pos_hist[-1])
+            grad_hist.append(grads)
             res_hist.append(float(val))
             updates, opt_state = optimizer.update(grads, opt_state)
             new_pos = optax.apply_updates(pos_hist[-1], updates)
@@ -1027,6 +1306,8 @@ class AnalyticResidual:
         best_idx = int(np.argmin(res_hist))
         best_res = res_hist[best_idx]
         best_pos = np.array(pos_hist[best_idx])
+        
+        #print(pos_hist[-200:-181], grad_hist[-200:-181], res_hist[-200:-181])
 
         if savename != "":
             self.writeFile(best_res, best_pos, N, freq, SNR, p, savename, starttime)
@@ -1035,8 +1316,10 @@ class AnalyticResidual:
 
 
 
-    def optimize_chain(self, N, freq, SNR, p, chain, loss="all", combine_in=True, savename="",
-                       step_callback=None, stop_event=None, stage_callback=None):
+    def optimize_chain(self, N, freq, SNR, p, chain, mirror="all", 
+                     combine_in=True, residual_limits=None, cost_limit=None, 
+                     loss="residual", worker=1, savename="", step_callback=None, 
+                     stop_event=None, stage_callback=None):
         """
         Run a sequence of optimizers, passing each result as the warm-start for the next.
 
@@ -1062,16 +1345,29 @@ class AnalyticResidual:
                     ("DE",   {"niter": 500, "popsize": 20}),
                     ("Adam", {"max_steps": 2000, "learning_rate": 1e-4}),
                 ]
-        loss : string, optional
+        mirror : string, optional
             Mirror selection for the residual. The default is "all".
         combine_in : bool, optional
             Whether to treat in-mirrors as correlated. The default is True.
+        residual_limits, cost_limit, loss : optional
+            Forwarded to loss_function() — see there for details. The default
+            loss is "residual" (plain residual, boundary-penalized).
+        worker : int, optional
+            Forwarded to each PSO/DE stage as their `worker` (see optimize_PSO/
+            optimize_DE for what it does and its requirements); ignored by Adam
+            stages, which have no population to parallelize over. The default is 1.
         savename : string, optional
             If non-empty, write final result to this file. The default is "".
         step_callback : callable(step, residual, state) or None, optional
-            Forwarded to each Adam stage. See optimize_Adam for details.
+            Forwarded to every stage (PSO iteration / DE generation / Adam step —
+            see the respective optimize_* method for exactly when it's called).
         stop_event : threading.Event or None, optional
-            Forwarded to each Adam stage. When set, stops the current Adam loop.
+            Forwarded to every stage; when set, the current stage stops and the
+            chain aborts before starting its next stage (see the respective
+            optimize_* method for exactly when it's checked).
+        stage_callback : callable(text) or None, optional
+            Called once when each stage begins, with a short human-readable label
+            (e.g. "Stage 1/2: DE"). Use this to update a GUI status line.
 
         Returns
         -------
@@ -1094,25 +1390,29 @@ class AnalyticResidual:
 
             if method_lc in ("pso", "particleswarm"):
                 current_residual, current_state = self.optimize_PSO(
-                    N, freq, SNR, p, loss=loss, combine_in=combine_in,
-                    optimization_options=options,
+                    N, freq, SNR, p, mirror=mirror, combine_in=combine_in,
+                    residual_limits=residual_limits, cost_limit=cost_limit, 
+                    loss=loss, optimization_options=options, worker=worker,
                     step_callback=step_callback,
                     stop_event=stop_event, savename=savename
                 )
 
             elif method_lc in ("de", "differentialevolution"):
                 current_residual, current_state = self.optimize_DE(
-                    N, freq, SNR, p, loss=loss, combine_in=combine_in,
-                    optimization_options=options,
+                    N, freq, SNR, p, mirror=mirror, combine_in=combine_in, 
+                    residual_limits=residual_limits, cost_limit=cost_limit, 
+                    loss=loss, optimization_options=options, worker=worker,
                     step_callback=step_callback,
                     stop_event=stop_event, savename=savename
                 )
 
             elif method_lc == "adam":
                 current_residual, current_state = self.optimize_Adam(
-                    N, freq, SNR, p, loss=loss, combine_in=combine_in,
-                    optimization_options=options, initial_state=current_state,
-                    step_callback=step_callback, stop_event=stop_event, savename=savename
+                    N, freq, SNR, p, mirror=mirror, combine_in=combine_in, 
+                    residual_limits=residual_limits, cost_limit=cost_limit, 
+                    loss=loss, optimization_options=options, 
+                    initial_state=current_state, step_callback=step_callback, 
+                    stop_event=stop_event, savename=savename
                 )
 
             else:
@@ -1262,7 +1562,7 @@ class AnalyticResidual:
         f.write("plt.plot([0,e3[0]], [0,e3[1]], '--', c='k')\n")
         f.write("ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')\n")
         f.write("ax.set_title('Energy=' + str(np.round(Energy, 4)))\n")
-        f.write("plt.show()\n")
+        f.write("plt.show()\n\n\n")
         f.write('#Finished in ' + str(np.round((time.time() - starttime) / 60, 2)) + ' minutes')
 
         f.close()
@@ -1294,6 +1594,15 @@ class AnalyticResidual:
 
 
 class ReadData:
+    """Parse a record written by AnalyticResidual.writeFile().
+
+    Reads by jumping to fixed line offsets (energyline, stateline, ... at the
+    top of this module) rather than parsing the file structurally, so it only
+    works against writeFile()'s exact current layout — see ReadData2/writeFile2
+    for a more robust key=value alternative. Multiple runs appended to the same
+    file are indexed with the `i` parameter (0-based, each record `blocksize`
+    lines long).
+    """
 
     energy = 1
     time = 0

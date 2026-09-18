@@ -32,7 +32,7 @@ if __name__ == '__main__':
     multi = 1       #seismometers per borehole
     Ntunnel = 50    #seismometers per tunnel
     displace = 0    #m random displacement from optimal position
-    loss = "max"
+    mirror = "max"  # which mirror(s) residual() reports on (used below and in filenames)
     mode = "disallB" #"Nplot", "disallB", ""
     #"Nplot" produces curves for different numbers of boreholes in one plot
     #"disallB" and "" produces curves for different numbers of seismometers per borehole
@@ -82,9 +82,7 @@ if __name__ == '__main__':
         
         for seed in range(max(1, statistics)):
             np.random.seed(seed)
-            
-            ar.set_default_mode("volume multiple"+str(multi))
-            
+
             #read data file
             if mode!="Nplot":
                 data = AO.ReadData("multiple"+str(multi), "resultFiles", N, i=1)
@@ -108,22 +106,20 @@ if __name__ == '__main__':
             if mode=="Nplot":
                 newstate+= np.random.normal(0,displace,newstate.shape)
             newstate = np.concatenate((newstate, np.array([np.linspace(0,5000,Ntunnel)*ar.e1[0],np.linspace(0,5000,Ntunnel)*ar.e1[1],np.zeros(Ntunnel)]).T, np.array([np.linspace(0,5000,Ntunnel)*ar.e2[0],np.linspace(0,5000,Ntunnel)*ar.e2[1],np.zeros(Ntunnel)]).T))
-            
-            ar.set_default_mode("volume")
-            
+
             #precalculation and saving of broadband residuals
             if mode=="Nplot":
-                filename="N"+str(N)+"t"+str(Ntunnel)+"dis"+str(displace)+str(loss)+str(seed)+".npy"
+                filename="N"+str(N)+"t"+str(Ntunnel)+"dis"+str(displace)+str(mirror)+str(seed)+".npy"
             elif mode=="disallB" and statistics>1:
-                filename="N"+str(N)+"multi"+str(multi)+"t"+str(Ntunnel)+"disAllB"+str(displace)+str(loss)+str(seed)+".npy"
+                filename="N"+str(N)+"multi"+str(multi)+"t"+str(Ntunnel)+"disAllB"+str(displace)+str(mirror)+str(seed)+".npy"
             else:
-                filename="N"+str(N)+"multi"+str(multi)+"t"+str(Ntunnel)+"dis"+str(displace)+str(loss)+str(seed)+".npy"
-            
+                filename="N"+str(N)+"multi"+str(multi)+"t"+str(Ntunnel)+"dis"+str(displace)+str(mirror)+str(seed)+".npy"
+
             if not os.path.exists(path+filename):
-                
+
                 resids=[]
                 for freq in freqs:
-                    resids.append(ar.residual(newstate,2*Ntunnel+data.N*multi,freq,data.SNR,data.p,"max"))
+                    resids.append(ar.residual(newstate,2*Ntunnel+data.N*multi,freq,data.SNR,data.p,mirror))
                 np.save(path+filename,resids)
             all_resids[:,seed] = np.load(path+filename)
             
@@ -144,11 +140,11 @@ if __name__ == '__main__':
     
     #saving
     if mode=="Nplot":
-        plt.savefig(path+"broadbandNPlot"+"t"+str(Ntunnel)+"dis"+str(displace)+str(loss)+".pdf")
+        plt.savefig(path+"broadbandNPlot"+"t"+str(Ntunnel)+"dis"+str(displace)+str(mirror)+".pdf")
     elif mode=="disallB" and statistics>1:
-        plt.savefig(path+"broadbandPlotN"+str(N)+"t"+str(Ntunnel)+"disAllB"+str(displace)+str(loss)+".pdf")
+        plt.savefig(path+"broadbandPlotN"+str(N)+"t"+str(Ntunnel)+"disAllB"+str(displace)+str(mirror)+".pdf")
     else:
-        plt.savefig(path+"broadbandPlotN"+str(N)+"t"+str(Ntunnel)+"dis"+str(displace)+str(loss)+".pdf")
+        plt.savefig(path+"broadbandPlotN"+str(N)+"t"+str(Ntunnel)+"dis"+str(displace)+str(mirror)+".pdf")
     
     
     #~3D-Plot of geometry and state~#
