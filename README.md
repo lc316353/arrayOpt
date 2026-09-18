@@ -19,7 +19,7 @@ In a new virtual environment run
     pip install optax==0.2.4
 
 
-##Files
+## Files
 
 * arrayOpt.py is the center of the tool yielding the class AnalyticalResidual that has a lot of helping functions to calculate the residual based on calculations by Francesca Badaracco and optimization tools that are partly based on JAX.
 * jax_bessel.py contains solutions for functions that are originally written by other internet users. It is needed by arrayOpt.py
@@ -28,7 +28,7 @@ In a new virtual environment run
 * runOptimizations.py is a simple example file on how to use arrayOpt.
 * test_arrayOpt.py contains test functions for debugging.
 
-##Credits
+## Credits
 
 Based on code and calculations from Francesca Badaracco (https://github.com/LaBadda/Newtonian_Noise_optimizations).
 Some functions were found in online forums (jax_bessel.py)
